@@ -1,4 +1,3 @@
-
 //Прога регулятора нагрева
 
 //Библиотеки
@@ -9,37 +8,42 @@
 //#include <EasyButton.h> //Библиотека приема сигналов с кнопок
 #include <LiquidCrystal_I2C.h> //Библиотека для i2c дисплеев
 #include <Preferences.h> //Библиотека для работы с энергонезависимой памятью конкретно в ESP32
-//#include "MAX31855.h" //Установлена библиотека Роба Тилларта MAX31855_RT
+#include "MAX31855.h" //Библиотека Роба Тилларта MAX31855_RT
+#include "MAX6675.h" //Библиотека Роба Тилларта MAX6675
 //#include <WiFi.h> //Библиотека для работы с WiFi
+#include <HTTPClient.h> //Библиотека для отправки post запроса на ntfy
 #include <AsyncTCP.h>           //Какая-то служебная библиотека для WebSerialLite.h
 #include <ESPAsyncWebServer.h>  //Какая-то служебная библиотека для WebSerialLite.h
 #include <WebSerialLite.h>      //Библиотека Serial по WEB (облегченная версия, то что нужно)
-#include <GyverMAX6675_SPI.h>       //Библиотека MAX6675
-
+//#include <GyverMAX6675_SPI.h>   //Библиотека MAX6675
+//#include "Adafruit_MAX31855.h"  //Библиотека MAX31855 от Adafruit
 
 //Месточисления для статуса
 #define Off 0
 #define On 1
-#define Done 2
+#define Done 2 //Не используется
 #define Err 3
 
 //Объявление констант
 //Константы пинов
 const byte HeatOn_s_pin = 33; //Пин для включенного положения переключателя (пока что не используется)
 const byte HeatOff_s_pin = 25; //Пин для выключенного положения переключателя (пока что не используется)
-const byte Done_pin = 26; //Светодиод готовности (с появлением экрана стал почти не нужен) (пока что не используется)
+const byte Done_pin = 26; //Светодиод готовности (с появлением экрана стал не нужен) (пока что не используется)
 const byte Relay_pin = 32; //Управление реле нагрева
-const byte Leak_pin1 = 13; //Пины датчиков протечки, работают в touch режиме
-const byte Leak_pin2 = 14;
-const byte Leak_pin3 = 27;
-const byte tc_pod_CS = 4; //Пины CS (SS) сигнала активации датчиков термопары
-const byte tc_nag_CS = 16;
-//18 и 19 пины заняты под SPI
+const byte Leak_pin1 = 13; //Пин первого датчика протечки
+const byte Leak_pin2 = 14; //Пин второго датчика протечки
+const byte Leak_pin3 = 27; //Пин третьего датчика протечки
+const byte tc_pod_CS = 18; //Пин CS (SS) для подложкодержателя
+const byte tc_nag_CS = 16; //Пин CS (SS) для нагревателя
+const byte tc_ctrl_CS = 19; //Пин CS (SS) для контрольной термопары
+const byte SPI_SO = 17; //Пин SPI
+const byte SPI_SCK = 4; //Пин SPI
+//21 и 22 пины заняты под i2c
 
-const byte meas_count = 5; //Окно скользящего среднего для значений температуры (мб логично что это должно быть в пределах от 3 до 8)
+const byte meas_count = 1; //Окно скользящего среднего для значений температуры (мб логично что это должно быть в пределах от 3 до 8, но если значения стабильны, то можно и 1). Чем больше, тем медленнее реакция системы, но лучше сглаживание.
 const float meas_rate = (2.0 / (meas_count + 1.0)); //Используется для вычисления скользящего среднего
-const char* ssid = "Minternet"; //SSID сети
-const char* password = "dodgezoo"; //WiFi Password
+const char* ssid = "WiFi name"; //SSID сети
+const char* password = "WiFi password"; //WiFi Password
 
 //Объявим переменные
 byte Status = Off; //Переменная статуса нагрева; 0 - выкл, 1 - вкл, 2 - достигло цели, поддержание температуры
@@ -50,16 +54,20 @@ unsigned long time_serial = 3000; //Время таймера вывода ин�
 bool Serial_st = On; //Включает - выключает Serial
 bool WebSerial_st = On; //Включает - выключает WebSerial
 bool Display_st = On; //Включает - выключает обновление дисплея
+bool Notify_st = On; //Включает - выключает отправку уведомлений об экстренных ситуациях
+bool Leak_notify_sended = 0; //Переменная для контроля отправки уведомления
 
 //Переменные связанные с нагревом
-float hyst_t = 5; //Гистерезис температуры                  (изменить тип данных на тот, который подойдёт для установки)
+float hyst_t = 5; //Гистерезис температуры
 unsigned long goal_t = 400; //Целевая температура
 float curr_t_pod = 10; //Текущая температура подложки
 float curr_t_nag = 10; //Текущая температура нагревателя
+float curr_t_ctrl = 10; //Текущая температура контрольной термопары
 float curr_t_pod_d = 10; //Текущая температура датчика термопары подложки
 float curr_t_nag_d = 10; //Текущая температура датчика термопары нагревателя
-unsigned long time_relay = 1000; //Время изменения состояния реле в мс
-unsigned long time_tc = 230; //Время таймера опроса датчиков термопары (не может быть меньше 100 мс)
+float curr_t_ctrl_d = 10; //Текущая температура датчика термопары нагревателя
+unsigned long time_relay = 2000; //Время изменения состояния реле в мс. От него сильно зависит точность. Нужно подбирать оптимальное значение.
+unsigned long time_tc = 230; //Время таймера опроса датчиков термопары (не может быть меньше 200 мс). Должно быть меньше time_relay.
 float k_t = 0.5; //Коэффициент обратной связи (нужно подобрать)
 unsigned long tmr_relay = 0; //Таймер изменения состояния реле (на millis, ручной)
 
@@ -67,12 +75,13 @@ unsigned long tmr_relay = 0; //Таймер изменения состояни�
 GyverRelay regulator(REVERSE); //Задание класса регулятора
 LiquidCrystal_I2C lcd = LiquidCrystal_I2C(0x27, 20, 4); //Задание класса экрана
 Preferences pref; //Задание класса энергонезависимой памяти
-/*MAX31855 tc_pod(tc_pod_CS, &SPI); //Задание класса для датчика температуры подложки
-MAX31855 tc_pod(17, 19, 18);
-MAX31855 tc_nag(tc_nag_CS, &SPI); //Задание класса для датчика температуры нагревателя */
 AsyncWebServer server(80); //Задание класса вебсервера на 80 порту
-GyverMAX6675_SPI<tc_pod_CS> tc_pod; //Задание класса для датчика температуры подложки
-
+//GyverMAX6675_SPI<tc_pod_CS> tc_pod; //Задание класса для датчика температуры подложки
+//Adafruit_MAX31855 tc_nag(SPI_SCK, tc_nag_CS, SPI_SO); //Задание класса датчика термопары нагревателя
+//Adafruit_MAX31855 tc_pod(SPI_SCK, tc_pod_CS, SPI_SO); //Задание класса датчика термопары подложкодержателя
+MAX31855 tc_nag(tc_nag_CS, SPI_SO, SPI_SCK); //Задание класса датчика термопары нагревателя
+MAX31855 tc_pod(tc_pod_CS, SPI_SO, SPI_SCK); //Задание класса датчика термопары подложкодержателя
+MAX6675 tc_ctrl(tc_ctrl_CS, SPI_SO, SPI_SCK); //Задание класса датчика контрольной термопары
 
 //Создание класса Таймер с возможностью автоперезапуска и паузы
 class Timer {
@@ -158,28 +167,42 @@ Timer tmr_print; //Таймер на 1 секунду для вывода инф
 Timer tmr_serial_put; //Таймер на 1 секунду для выводы инфы в сериал
 Timer tmr_tc_get; //Таймер для опроса датчиков термопары
 
+//Описание функций
+void Status_check();          //Функция проверки статуса (требует переработки)
+void Leak_test();             //Функция проверки пинов протечки. Проверяет пины на наличие сигнала и в соответствии с этим изменяет статус протечки.
+void regulator_check();       //Функция управления реле (на таймере внутри функции)
+void print_display();         //Функция вывода информации на lcd экран (на таймере)
+void serialget();             //Функция приема сигналов по Serial
+void serialput();             //Функция отправки сигналов по Serial (на таймере)
+void webserialput();          //Функция отправки сигналов по WebSerial (на таймере)
+void webserialget(uint8_t *data, size_t len); //Функция приема сообщений по WebSerial
+bool executer(char key, unsigned long val);   //Функция выполнения полученных команд. Исполняет полученные через serial команды. На вход принимает ключ и число.
+void infoserialput();         //Функция вывода полной информации в Serial
+void infowebserialput();      //Функция вывода полной информации в WebSerial
+void tcget31855();            //Функция получения и сглаживания данных термопар (на таймере)
+int leak_notification ();    //Функция отправки уведомлений при детектировании протечки
+void temp_notification ();    //Функция отправки уведомлений при детектировании экстремальных температур
+
 //Функция проверки статуса (требует переработки)
 void Status_check() {
-  if (curr_t_pod > goal_t + 30) {
+  if ((curr_t_pod > goal_t + 30) or (curr_t_pod_d > 120) or (curr_t_nag_d > 120) or (curr_t_pod > 700) or (curr_t_nag > 700) or (curr_t_pod < 5) or (curr_t_nag < 5)) {
     Status = Err;
-    digitalWrite(Done_pin, LOW);
-  } else if (curr_t_pod > goal_t - 5) {
+    if (Notify_st) {temp_notification ();}
+  } else if (curr_t_pod > goal_t - hyst_t) {
     Status = Done;
-    digitalWrite(Done_pin, HIGH);
-  } else {
-    Status = On;
-    digitalWrite(Done_pin, LOW);
   }
-
 }
 
-//Функция проверки пинов протечки
+//Функция проверки пинов протечки. Проверяет пины на наличие сигнала и в соответствии с этим изменяет статус протечки.
 void Leak_test() {
   Status_leak = 0;
   if (touchRead(Leak_pin1) == 0) {Status_leak += 1;} //0 на touchRead означает полную замкнутость, тоесть протечку
   if (touchRead(Leak_pin2) == 0) {Status_leak += 1;}
   if (touchRead(Leak_pin3) == 0) {Status_leak += 1;}
-  Serial.println(Status_leak);
+  if (Status_leak and Notify_st and (not Leak_notify_sended)) {
+    //leak_notification();
+    if (leak_notification() == 200) {Leak_notify_sended = 1;} //Переменной присваивается 1, чтобы уведомления не сыпались кучей
+  }
 }
 
 //Функция управления реле (на таймере внутри функции)
@@ -198,47 +221,15 @@ void print_display() {
   lcd.print(curr_t_pod, 3);
   lcd.setCursor(7, 1);
   lcd.print(curr_t_nag, 3);
+
 }
 
 //Функция приема сигналов по Serial
 void serialget() {
   if (Serial.available() > 1) {
-    //unsigned long ms = millis();
     char key = Serial.read();
     unsigned long val = Serial.parseInt();
-    switch (key) {
-      case 'g': //Целевая температура
-        goal_t = val;
-        pref.begin("heat_param", false);
-        pref.putULong("goal_t", goal_t);
-        pref.end();
-      break;
-      case 's': //Старт или стоп нагрев (присваивает статусу принимаемое значение)
-        if (val < 4) {Status = val;}
-      break;
-      case 'h': //Гистерезис, вводить в 1000 раз большее значение (это позволяет вводить от 0,001 до 4 млн)
-        hyst_t = val / 1000;
-        pref.begin("heat_param", false);
-        //pref.putFloat("hyst_t", hyst_t);
-        pref.end();
-      break;
-      case 'k': //Коэффициент обратной связи, вводить в 1000 раз большее значение (это позволяет вводить от 0,001 до 4 млн)
-        k_t = val / 1000;
-        pref.begin("heat_param", false);
-        //pref.putFloat("k_t", k_t);
-        pref.end();
-      break;
-      case 'r': //Время изменения состояния реле в мс
-        if (val > 50) {
-          time_relay = val;
-          pref.begin("heat_param", false);
-          //pref.putULong("time_relay", time_relay);
-          pref.end();
-        }
-      break;
-
-    }
-    //Serial.println(millis() - ms);
+    executer(key, val);
   }
 }
 
@@ -248,13 +239,19 @@ void serialput() {
   Serial.print("; ");
   Serial.print(curr_t_nag, 0);
   Serial.print("; ");
+  Serial.print(curr_t_ctrl, 0);
+  Serial.print("; ");
   Serial.print(curr_t_pod_d, 0);
   Serial.print("; ");
   Serial.print(curr_t_nag_d, 0);
   Serial.print("; ");
+  Serial.print(curr_t_ctrl_d, 0);
+  Serial.print("; ");
   Serial.print(goal_t);
   Serial.print("; ");
   Serial.print(Status);
+  Serial.print("; ");
+  Serial.print(Status_leak);
   Serial.println("; ");
 }
 
@@ -264,81 +261,276 @@ void webserialput() {
   WebSerial.print("; ");
   WebSerial.print(curr_t_nag);
   WebSerial.print("; ");
+  WebSerial.print(curr_t_ctrl);
+  WebSerial.print("; ");
   WebSerial.print(curr_t_pod_d);
   WebSerial.print("; ");
   WebSerial.print(curr_t_nag_d);
-  WebSerial.print("; ");
+  WebSerial.print("; "); 
+  WebSerial.print(curr_t_ctrl_d);
+  WebSerial.print("; "); 
   WebSerial.print(goal_t);
   WebSerial.print("; ");
   WebSerial.print(Status);
+  WebSerial.print("; ");
+  WebSerial.print(Status_leak);
   WebSerial.println("; ");
 }
 
-//Функция приема сообщений (нуждается в существенном сокращении)
-void recvMsg(uint8_t *data, size_t len){
-  WebSerial.println("Received Data...");
-  String d = "";
-  for(int i=0; i < len; i++){
-    d += char(data[i]);
+//Функция приема сообщений (нуждается в существенном сокращении и изменении)
+void webserialget(uint8_t *data, size_t len){
+  unsigned long val = 0;
+  //WebSerial.println("Received Data...");
+  //String d = "";
+  char key = char(data[0]);
+  for(int i=1; i < len; i++){
+    //d += char(data[i]);
+    val = val + pow (10, (i-1)) * (char(data[i]) - '0');
   }
-  WebSerial.println(d);
+  //WebSerial.println(d);
+  executer(key, val);
 }
 
-//Функция получения данных термопар (на таймере)
-/*void tcget() {
-  byte S_tc_pod = tc_pod.read();
-  //byte S_tc_nag = tc_nag.read();
-  if (S_tc_pod) { //S_tc_pod + S_tc_nag
-    Status = Err; //Добавить сюда ещё инфы для отладки (желательно, чтобы в Serial и на экран транслировалось)
-  } else {
-    //curr_t_pod = meas_rate * tc_pod.getTemperature() + ((1 - meas_rate) * curr_t_pod); //Вычисление скользящего среднего
-    //curr_t_pod = tc_pod.getTemperature();
-    Serial.println(tc_pod.getTemperature());
-    //curr_t_nag = meas_rate * tc_nag.getTemperature() + ((1 - meas_rate) * curr_t_nag);
-    //curr_t_pod_d = meas_rate * tc_pod.getInternal() + ((1 - meas_rate) * curr_t_pod_d);
-    //curr_t_pod_d = tc_pod.getInternal();
-    Serial.println(tc_pod.getInternal());
-    Serial.println(tc_pod.getRawData(), BIN);
-    //curr_t_nag_d = meas_rate * tc_nag.getInternal() + ((1 - meas_rate) * curr_t_nag_d);
+//Функция выполнения полученных команд. Исполняет полученные через serial команды. На вход принимает ключ и число. Добавить отключение датчиков протечки и отключение serial.
+bool executer(char key, unsigned long val) {
+  switch (key) {
+    case 'g': //Целевая температура
+      goal_t = val;
+      pref.begin("heat_param", false);
+      pref.putULong("goal_t", goal_t);
+      pref.end();
+      return true;
+    break;
+    case 's': //Старт или стоп нагрев (присваивает статусу принимаемое значение)
+      if (val < 4) {
+        Status = val;
+        return true;
+      }
+    break;
+    case 'h': //Гистерезис, вводить в 1000 раз большее значение (это позволяет вводить от 0,001 до 4 млн)
+      hyst_t = val / 1000;
+      pref.begin("heat_param", false);
+      pref.putFloat("hyst_t", hyst_t);
+      pref.end();
+      return true;
+    break;
+    case 'k': //Коэффициент обратной связи, вводить в 1000 раз большее значение (это позволяет вводить от 0,001 до 4 млн)
+      k_t = val / 1000;
+      pref.begin("heat_param", false);
+      pref.putFloat("k_t", k_t);
+      pref.end();
+      return true;
+    break;
+    case 'r': //Время изменения состояния реле в мс
+      if (val > 100) {
+        time_relay = val;
+        pref.begin("heat_param", false);
+        pref.putULong("time_relay", time_relay);
+        pref.end();
+        return true;
+      }
+    break;
+    case 'l': //Вкл/выкл serial
+      Serial_st = val;
+      if (Serial_st or WebSerial_st) { //Если хотябы один Serial включен, то принятые значения можно записать в память. В ином случае не записывать, пусть при перезагрузке сбросятся.
+        pref.begin("heat_param", false);
+        //pref.putULong("Serial_st", Serial_st); //Выбрать подходящий тип данных
+        pref.end();
+        return true;
+      }
+    break;
+    case 'w': //Вкл/выкл webserial
+      WebSerial_st = val;
+      if (Serial_st or WebSerial_st) { //Если хотябы один Serial включен, то принятые значения можно записать в память. В ином случае не записывать, пусть при перезагрузке сбросятся.
+        pref.begin("heat_param", false);
+        //pref.putULong("WebSerial_st", WebSerial_st); //Выбрать подходящий тип данных
+        pref.end();
+        return true;
+      }
+    break;
+    case 'i': //Выводит общую информацию о системе в serial и webserial
+      if (WebSerial_st) {infowebserialput();}
+      if (Serial_st) {infoserialput();}
+    break;
   }
-} */
+  return false;
+}
 
-//Функция получения данных термопар (на таймере)
-void tcget() {
-  if (tc_pod.readTemp()) {
-    curr_t_pod = meas_rate * tc_pod.getTemp() + ((1 - meas_rate) * curr_t_pod);
+//Функция получения и сглаживания данных термопар (на таймере)
+void tcget31855() {
+  if (not tc_nag.read()) {
+    curr_t_nag = meas_rate * tc_nag.getTemperature() + ((1 - meas_rate) * curr_t_nag);
+    curr_t_nag_d = meas_rate * tc_nag.getInternal() + ((1 - meas_rate) * curr_t_nag_d);
   } else {Status = Err;}
+  if (not tc_pod.read()) {
+    curr_t_pod = meas_rate * tc_pod.getTemperature() + ((1 - meas_rate) * curr_t_pod);
+    curr_t_pod_d = meas_rate * tc_pod.getInternal() + ((1 - meas_rate) * curr_t_pod_d);
+  } else {Status = Err;}
+  if (not tc_ctrl.read()) {
+    curr_t_ctrl = meas_rate * tc_ctrl.getTemperature() + ((1 - meas_rate) * curr_t_ctrl);
+    //curr_t_ctrl_d = meas_rate * tc_ctrl.getInternal() + ((1 - meas_rate) * curr_t_ctrl_d);
+  } else {Status = Err;}
+  /*
+  Serial.print(tc_nag.getInternal());
+  Serial.println(tc_nag.getTemperature()); 
+  tc_pod.read();
+  Serial.print(tc_pod.getInternal());
+  Serial.println(tc_pod.getTemperature());
+  */
+}
+
+//Функция вывода полной информации в Serial
+void infoserialput() {
+  Serial.println("=====Текущая информация=====");
+  Serial.print("Текущая температура подложки: "); Serial.println(curr_t_pod);
+  Serial.print("Текущая температура нагревателя: "); Serial.println(curr_t_nag);
+  Serial.print("Текущая температура контрольной термопары: "); Serial.println(curr_t_ctrl);
+  Serial.print("Текущая температура датчика термопары для подложки: "); Serial.println(curr_t_pod_d);
+  Serial.print("Текущая температура датчика термопары для нагревателя: "); Serial.println(curr_t_nag_d);
+  Serial.print("Текущая температура датчика контрольной термопары: "); Serial.println(curr_t_ctrl_d);
+  Serial.print("Статус протечки: ");
+  if (Status_leak == 0) {Serial.println("протечка отсутствует");} else 
+    {
+      Serial.print("протечка обнаружена ");
+      Serial.print(Status_leak);
+      if (Status_leak == 1) {Serial.println(" датчиком");} else {Serial.println(" датчиками");}
+    }
+  Serial.println("=====Конец текущей информации=====");
+  Serial.println("=====Общая информация=====");
+  Serial.print("Целевая температура: "); Serial.println(goal_t);
+  Serial.print("Статус: "); Serial.println(Status);
+  Serial.print("Гистерезис: "); Serial.println(hyst_t);
+  Serial.print("Коэффициент обратной связи: "); Serial.println(k_t);
+  Serial.print("Время изменения состояния реле в мс: "); Serial.println(time_relay);
+  if (Serial_st) {Serial.println("Serial включен");} else {Serial.println("Serial выключен");}
+  if (WebSerial_st) {Serial.println("WebSerial включен");} else {Serial.println("Serial выключен");}
+  Serial.println("=====Конец общей информации=====");
+  Serial.println("=====Справочная информация=====");
+  Serial.println("Система автоматического управления нагревом by zertet");
+  Serial.println("Управление системой происходит посредством комманд. Каждая команда состоит из ключа и числа.");
+  Serial.println("Например, команда 'g260' установит целевую температуру в 260 градусов цельсия.");
+  Serial.println("g - целевая температура нагрева");
+  Serial.println("s - статус нагрева. 0 - выкл, 1 - вкл, 2 - готово, 3 - ошибка");
+  Serial.println("h - гистерезис в градусах цельсия. Вводить значение, умноженное на 1000.");
+  Serial.println("k - коэффициент обратной связи. Вводить значение, умноженное на 1000.");
+  Serial.println("r - скорость срабатывания реле в мс");
+  Serial.println("l - вкл/выкл Serial");
+  Serial.println("w - вкл/выкл WebSerial. Требует перезагрузку.");
+  Serial.println("i - вывести эту справку");
+  Serial.println("Таким образом для включения WebSerial нужно ввести w1, для получения справки i1, для установки гистерезиса в значение 1 градус цельсия h1000.");
+  Serial.println("=====Конец справочной информации=====");
+}
+
+//Функция вывода полной информации в WebSerial
+void infowebserialput() {
+  WebSerial.println("=====Текущая информация=====");
+  WebSerial.print("Текущая температура подложки: "); WebSerial.println(curr_t_pod);
+  WebSerial.print("Текущая температура нагревателя: "); WebSerial.println(curr_t_nag);
+  WebSerial.print("Текущая температура контрольной термопары: "); WebSerial.println(curr_t_ctrl);
+  WebSerial.print("Текущая температура датчика термопары для подложки: "); WebSerial.println(curr_t_pod_d);
+  WebSerial.print("Текущая температура датчика термопары для нагревателя: "); WebSerial.println(curr_t_nag_d);
+  WebSerial.print("Текущая температура датчика контрольной термопары: "); WebSerial.println(curr_t_ctrl_d);
+  WebSerial.print("Статус протечки: ");
+  if (Status_leak == 0) {WebSerial.println("протечка отсутствует");} else 
+    {
+      WebSerial.print("протечка обнаружена ");
+      WebSerial.print(Status_leak);
+      if (Status_leak == 1) {WebSerial.println(" датчиком");} else {WebSerial.println(" датчиками");}
+    }
+  WebSerial.println("=====Конец текущей информации=====");
+  WebSerial.println("=====Общая информация=====");
+  WebSerial.print("Целевая температура: "); WebSerial.println(goal_t);
+  WebSerial.print("Статус: "); WebSerial.println(Status);
+  WebSerial.print("Гистерезис: "); WebSerial.println(hyst_t);
+  WebSerial.print("Коэффициент обратной связи: "); WebSerial.println(k_t);
+  WebSerial.print("Время изменения состояния реле в мс: "); WebSerial.println(time_relay);
+  if (Serial_st) {WebSerial.println("Serial включен");} else {WebSerial.println("Serial выключен");}
+  if (WebSerial_st) {WebSerial.println("WebSerial включен");} else {WebSerial.println("Serial выключен");}
+  WebSerial.println("=====Конец общей информации=====");
+  WebSerial.println("=====Справочная информация=====");
+  WebSerial.println("Система автоматического управления нагревом by zertet");
+  WebSerial.println("Управление системой происходит посредством комманд. Каждая команда состоит из ключа и числа.");
+  WebSerial.println("Например, команда 'g260' установит целевую температуру в 260 градусов цельсия.");
+  WebSerial.println("g - целевая температура нагрева");
+  WebSerial.println("s - статус нагрева. 0 - выкл, 1 - вкл, 2 - готово, 3 - ошибка");
+  WebSerial.println("h - гистерезис в градусах цельсия. Вводить значение, умноженное на 1000.");
+  WebSerial.println("k - коэффициент обратной связи. Вводить значение, умноженное на 1000.");
+  WebSerial.println("r - скорость срабатывания реле в мс");
+  WebSerial.println("l - вкл/выкл Serial");
+  WebSerial.println("w - вкл/выкл WebSerial. Требует перезагрузку.");
+  WebSerial.println("i - вывести эту справку");
+  WebSerial.println("Таким образом для включения WebSerial нужно ввести w1, для получения справки i1, для установки гистерезиса в значение 1 градус цельсия h1000.");
+  WebSerial.println("=====Конец справочной информации=====");
+}
+
+//Функция отправки уведомлений при детектировании протечки
+int leak_notification () {
+  WiFiClient client;
+  HTTPClient http;
+  // Your Domain name with URL path or IP address with path
+  http.begin(client, "http://ntfy.mt11.su:8081/vup_emergency");
+  // Specify content-type header
+  http.addHeader("Title", "Система ВУП-11М");
+  http.addHeader("Priority", "max");
+  // Data to send with HTTP POST
+  String httpRequestData = "Обнаружена протечка!";
+  // Send HTTP POST request
+  int httpResponseCode = http.POST(httpRequestData);
+  Serial.print("HTTP Response code: ");
+  Serial.println(httpResponseCode);
+  http.end();
+  return httpResponseCode;
+}
+
+//Функция отправки уведомлений при детектировании экстремальных температур
+void temp_notification () {
+  WiFiClient client;
+  HTTPClient http;
+  // Your Domain name with URL path or IP address with path
+  http.begin(client, "http://ntfy.mt11.su:8081/vup_emergency");
+  // Specify content-type header
+  http.addHeader("Title", "Система ВУП-11М");
+  http.addHeader("Priority", "max");
+  // Data to send with HTTP POST
+  String httpRequestData = "Сheck the temperature!";
+  // Send HTTP POST request
+  int httpResponseCode = http.POST(httpRequestData);
+  Serial.print("HTTP Response code: ");
+  Serial.println(httpResponseCode);
+  http.end();
 }
 
 void setup() {
   //Задание Serial
   Serial.begin(115200);
-  Serial.setTimeout(1); //Установка таумаута для парсинга принимаемых значений (потом мб уменьшить или увеличить)
+  Serial.setTimeout(1); //Установка таймаута для парсинга принимаемых значений (потом мб уменьшить или увеличить)
   delay (150);
   Serial.println("ESP32 начинает включаться");
 
-  //Задание WiFi (ничего не понятно, разобраться!)
-  WiFi.mode(WIFI_STA); //Выбираем режим WiFi
-  WiFi.begin(ssid, password); //Логинемся
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) { //Проверяем, успешна ли авторизация
-      Serial.printf("WiFi Failed!\n");
-      WebSerial_st = Off; //Выключаем вебсериал чтобы не было ошибок
-      return;
+  //Задание WiFi
+  if (WebSerial_st) {
+    WiFi.mode(WIFI_STA); //Выбираем режим WiFi
+    WiFi.begin(ssid, password); //Логинемся
+    if (WiFi.waitForConnectResult() != WL_CONNECTED) { //Проверяем, успешна ли авторизация
+        Serial.printf("WiFi Failed!\n");
+        WebSerial_st = Off; //Выключаем вебсериал чтобы не было ошибок
+        return;
+    }
   }
   if (WebSerial_st) {
     Serial.print("IP Address: "); //Выводим в Serial свой ip
     Serial.println(WiFi.localIP());
-    // WebSerial доступен по "<IP Address>/webserial" в браузере
+    if (Serial_st) {Serial.println("WebSerial доступен по <IP Address>/webserial в браузере");}
     WebSerial.begin(&server); //Стартуем WEBSerial передавая в него параметром объект класса AsyncWebServer
-    WebSerial.onMessage(recvMsg); //Задаем функцию которая будет вызываться при получении сообщения
+    WebSerial.onMessage(webserialget); //Задаем функцию которая будет вызываться при получении сообщения
     server.begin(); //Запускаем веб сервер 
   }
 
   //Задание SPI для датчиков термопар
-  /*SPI.begin();
+  SPI.begin();
   tc_pod.begin();
-  tc_pod.setSPIspeed(9000);
-  tc_nag.begin(); */
+  tc_nag.begin();
+  tc_ctrl.begin();
 
   //Задание и чтение энергонезависимой памяти
   pref.begin("heat_param", false);
@@ -346,6 +538,8 @@ void setup() {
   hyst_t = pref.getFloat("hyst_t", hyst_t);
   k_t = pref.getFloat("k_t", k_t);
   time_relay = pref.getULong("time_relay", time_relay);
+  //Serial_st = pref.getULong("Serial_st", Serial_st); //Выбрать подходящий тип данных
+  //WebSerial_st = pref.getULong("WebSerial_st", WebSerial_st); //Выбрать подходящий тип данных
   pref.end();
 
   //Задание пинов переферии
@@ -353,9 +547,6 @@ void setup() {
   //pinMode(HeatOff_s_pin, INPUT);
   pinMode(Done_pin, OUTPUT);
   pinMode(Relay_pin, OUTPUT);
-  pinMode(Leak_pin1, INPUT_PULLUP);
-  pinMode(Leak_pin2, INPUT_PULLUP);
-  pinMode(Leak_pin3, INPUT_PULLUP);
 
   //Настройка регулятора
   regulator.setpoint = goal_t; //Установка целевой температуры
@@ -366,14 +557,16 @@ void setup() {
   tmr_print.start(time_print);
   tmr_serial_put.start(time_serial);
   tmr_tc_get.start(time_tc);
-  //tmr_1.start(1000); //Таймер отладки
 
   Serial.println("Проверка датчиков");
   for (int i = 0; i < (meas_count * 2); i++) { //Цикл первичных измерений. Нужен, чтобы наработать значения для скользящего среднего.
     delay(time_tc + 1); //Задержка опроса датчиков
-    tcget();
+    tcget31855();
   }
   if (Status == Err) {Serial.println("Ошибка! Температура не доступна!");}
+
+  if (WebSerial_st) {infowebserialput();}
+  if (Serial_st) {infoserialput();}
 
   if (Display_st) { //Задание начального текста на экране
     lcd.begin();
@@ -388,11 +581,13 @@ void setup() {
     //lcd.setCursor(0, 3);
     lcd.setCursor(11, 2);
     lcd.print(" Heat Off");
+    /*lcd.setCursor(0, 3);
+    lcd.print("Leak: ");
+    lcd.print("No");*/
   }
 }
 
 void loop() {
-  //Leak_test();
   //Status_check();
   if ((Status == On) or (Status == Done)) {regulator_check();} else {digitalWrite(Relay_pin, LOW);} //Срабатывает по таймеру и условию, чтобы передать температуру и изменить состояние реле
   if (tmr_print.ready(1) and Display_st) {print_display();} //Вывод информации на lcd дисплей
@@ -402,5 +597,5 @@ void loop() {
     if (Serial_st) {serialput();}
     if (WebSerial_st) {webserialput();}
   }
-  if (tmr_tc_get.ready(1)) {tcget();}
+  if (tmr_tc_get.ready(1)) {tcget31855();}
 }
