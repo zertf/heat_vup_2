@@ -10,13 +10,17 @@
 #include <Preferences.h> //Библиотека для работы с энергонезависимой памятью конкретно в ESP32
 #include "MAX31855.h" //Библиотека Роба Тилларта MAX31855_RT
 #include "MAX6675.h" //Библиотека Роба Тилларта MAX6675
-//#include <WiFi.h> //Библиотека для работы с WiFi
+#include <WiFi.h> //Библиотека для работы с WiFi
 #include <HTTPClient.h> //Библиотека для отправки post запроса на ntfy
 #include <AsyncTCP.h>           //Какая-то служебная библиотека для WebSerialLite.h
 #include <ESPAsyncWebServer.h>  //Какая-то служебная библиотека для WebSerialLite.h
 #include <WebSerialLite.h>      //Библиотека Serial по WEB (облегченная версия, то что нужно)
 //#include <GyverMAX6675_SPI.h>   //Библиотека MAX6675
 //#include "Adafruit_MAX31855.h"  //Библиотека MAX31855 от Adafruit
+
+//Библиотки для обменна данными с RPi
+//Библиотека для работы с WiFi подключена выше
+#include <WiFiUdp.h> //Библиотека для UDP протокола
 
 //Месточисления для статуса
 #define Off 0
@@ -36,14 +40,15 @@ const byte Leak_pin3 = 27; //Пин третьего датчика протеч
 const byte tc_pod_CS = 18; //Пин CS (SS) для подложкодержателя
 const byte tc_nag_CS = 16; //Пин CS (SS) для нагревателя
 const byte tc_ctrl_CS = 19; //Пин CS (SS) для контрольной термопары
+const byte tc_mag_CS = 15; //Пин CS (SS) четвёртого датчика подожки (магнетрон)
 const byte SPI_SO = 17; //Пин SPI
 const byte SPI_SCK = 4; //Пин SPI
 //21 и 22 пины заняты под i2c
 
 const byte meas_count = 1; //Окно скользящего среднего для значений температуры (мб логично что это должно быть в пределах от 3 до 8, но если значения стабильны, то можно и 1). Чем больше, тем медленнее реакция системы, но лучше сглаживание.
 const float meas_rate = (2.0 / (meas_count + 1.0)); //Используется для вычисления скользящего среднего
-const char* ssid = "WiFi name"; //SSID сети
-const char* password = "WiFi password"; //WiFi Password
+const char* ssid = "ИЗМЕНИТЬ на имя сети"; //SSID сети
+const char* password = "ИЗМЕНИТЬ на пароль сети"; //WiFi Password
 
 //Объявим переменные
 byte Status = Off; //Переменная статуса нагрева; 0 - выкл, 1 - вкл, 2 - достигло цели, поддержание температуры
@@ -63,13 +68,25 @@ unsigned long goal_t = 400; //Целевая температура
 float curr_t_pod = 10; //Текущая температура подложки
 float curr_t_nag = 10; //Текущая температура нагревателя
 float curr_t_ctrl = 10; //Текущая температура контрольной термопары
-float curr_t_pod_d = 10; //Текущая температура датчика термопары подложки
+float curr_t_mag = 10; //Текущая температура термопары магнетрона
+
+float curr_t_pod_d = 10; //Теку-щая температура датчика термопары подложки
 float curr_t_nag_d = 10; //Текущая температура датчика термопары нагревателя
 float curr_t_ctrl_d = 10; //Текущая температура датчика термопары нагревателя
+float curr_t_mag_d = 10; //Текущая температура датчика термопары магнетрона
+
 unsigned long time_relay = 2000; //Время изменения состояния реле в мс. От него сильно зависит точность. Нужно подбирать оптимальное значение.
 unsigned long time_tc = 230; //Время таймера опроса датчиков термопары (не может быть меньше 200 мс). Должно быть меньше time_relay.
 float k_t = 0.5; //Коэффициент обратной связи (нужно подобрать)
 unsigned long tmr_relay = 0; //Таймер изменения состояния реле (на millis, ручной)
+
+//Переменные связанные с передачей данных
+char packetBuffer[255];
+unsigned int localPort = 9999;
+const char *serverip = "192.168.0.119"; //IP адрес RPi
+unsigned int serverport = 8888;
+
+
 
 //Задание классов
 GyverRelay regulator(REVERSE); //Задание класса регулятора
@@ -81,7 +98,12 @@ AsyncWebServer server(80); //Задание класса вебсервера н
 //Adafruit_MAX31855 tc_pod(SPI_SCK, tc_pod_CS, SPI_SO); //Задание класса датчика термопары подложкодержателя
 MAX31855 tc_nag(tc_nag_CS, SPI_SO, SPI_SCK); //Задание класса датчика термопары нагревателя
 MAX31855 tc_pod(tc_pod_CS, SPI_SO, SPI_SCK); //Задание класса датчика термопары подложкодержателя
-MAX6675 tc_ctrl(tc_ctrl_CS, SPI_SO, SPI_SCK); //Задание класса датчика контрольной термопары
+//MAX6675 tc_ctrl(tc_ctrl_CS, SPI_SO, SPI_SCK); //Задание класса датчика контрольной термопары
+MAX31855 tc_ctrl(tc_ctrl_CS, SPI_SO, SPI_SCK); //Задание класса датчика контрольной термопары
+MAX31855 tc_mag(tc_mag_CS, SPI_SO, SPI_SCK); //Задание класса датчика термопары на магнетроне
+
+//Класс (объект) для обмена с RPi
+WiFiUDP udp;
 
 //Создание класса Таймер с возможностью автоперезапуска и паузы
 class Timer {
@@ -241,11 +263,15 @@ void serialput() {
   Serial.print("; ");
   Serial.print(curr_t_ctrl, 0);
   Serial.print("; ");
+  Serial.print(curr_t_mag, 0);
+  Serial.print("; ");
   Serial.print(curr_t_pod_d, 0);
   Serial.print("; ");
   Serial.print(curr_t_nag_d, 0);
   Serial.print("; ");
   Serial.print(curr_t_ctrl_d, 0);
+  Serial.print("; ");
+  Serial.print(curr_t_mag_d, 0);
   Serial.print("; ");
   Serial.print(goal_t);
   Serial.print("; ");
@@ -263,12 +289,16 @@ void webserialput() {
   WebSerial.print("; ");
   WebSerial.print(curr_t_ctrl);
   WebSerial.print("; ");
+  WebSerial.print(curr_t_mag);
+  WebSerial.print("; ");
   WebSerial.print(curr_t_pod_d);
   WebSerial.print("; ");
   WebSerial.print(curr_t_nag_d);
   WebSerial.print("; "); 
   WebSerial.print(curr_t_ctrl_d);
   WebSerial.print("; "); 
+  WebSerial.print(curr_t_mag_d);
+  WebSerial.print("; ");
   WebSerial.print(goal_t);
   WebSerial.print("; ");
   WebSerial.print(Status);
@@ -368,7 +398,11 @@ void tcget31855() {
   } else {Status = Err;}
   if (not tc_ctrl.read()) {
     curr_t_ctrl = meas_rate * tc_ctrl.getTemperature() + ((1 - meas_rate) * curr_t_ctrl);
-    //curr_t_ctrl_d = meas_rate * tc_ctrl.getInternal() + ((1 - meas_rate) * curr_t_ctrl_d);
+    curr_t_ctrl_d = meas_rate * tc_ctrl.getInternal() + ((1 - meas_rate) * curr_t_ctrl_d);
+  } else {Status = Err;}
+  if (not tc_mag.read()) {
+    curr_t_mag = meas_rate * tc_mag.getTemperature() + ((1 - meas_rate) * curr_t_mag);
+    curr_t_mag_d = meas_rate * tc_mag.getInternal() + ((1 - meas_rate) * curr_t_mag_d);
   } else {Status = Err;}
   /*
   Serial.print(tc_nag.getInternal());
@@ -385,9 +419,11 @@ void infoserialput() {
   Serial.print("Текущая температура подложки: "); Serial.println(curr_t_pod);
   Serial.print("Текущая температура нагревателя: "); Serial.println(curr_t_nag);
   Serial.print("Текущая температура контрольной термопары: "); Serial.println(curr_t_ctrl);
+  Serial.print("Текущая температура магнетрона: "); Serial.println(curr_t_mag);
   Serial.print("Текущая температура датчика термопары для подложки: "); Serial.println(curr_t_pod_d);
   Serial.print("Текущая температура датчика термопары для нагревателя: "); Serial.println(curr_t_nag_d);
   Serial.print("Текущая температура датчика контрольной термопары: "); Serial.println(curr_t_ctrl_d);
+  Serial.print("Текущая температура датчика термопары магнетрона: "); Serial.println(curr_t_mag_d);
   Serial.print("Статус протечки: ");
   if (Status_leak == 0) {Serial.println("протечка отсутствует");} else 
     {
@@ -422,6 +458,7 @@ void infoserialput() {
 }
 
 //Функция вывода полной информации в WebSerial
+//Пока нет для магнеторона
 void infowebserialput() {
   WebSerial.println("=====Текущая информация=====");
   WebSerial.print("Текущая температура подложки: "); WebSerial.println(curr_t_pod);
@@ -506,7 +543,7 @@ void setup() {
   Serial.setTimeout(1); //Установка таймаута для парсинга принимаемых значений (потом мб уменьшить или увеличить)
   delay (150);
   Serial.println("ESP32 начинает включаться");
-
+  
   //Задание WiFi
   if (WebSerial_st) {
     WiFi.mode(WIFI_STA); //Выбираем режим WiFi
@@ -516,7 +553,12 @@ void setup() {
         WebSerial_st = Off; //Выключаем вебсериал чтобы не было ошибок
         return;
     }
+    else {
+    udp.begin(localPort);
+    Serial.printf("UDP Client : %s:%i \n", WiFi.localIP().toString().c_str(), localPort); //Информация о IP Arduino
+    }
   }
+
   if (WebSerial_st) {
     Serial.print("IP Address: "); //Выводим в Serial свой ip
     Serial.println(WiFi.localIP());
@@ -531,6 +573,7 @@ void setup() {
   tc_pod.begin();
   tc_nag.begin();
   tc_ctrl.begin();
+  tc_mag.begin();
 
   //Задание и чтение энергонезависимой памяти
   pref.begin("heat_param", false);
@@ -588,7 +631,49 @@ void setup() {
 }
 
 void loop() {
-  //Status_check();
+  //Часть ответственная за получение информации от RPi
+  //Тестовый варинат
+  /*
+  int packetSize = udp.parsePacket();
+  if (packetSize) {
+    Serial.print("Received packet from : "); Serial.println(udp.remoteIP());
+    int len = udp.read(packetBuffer, 255);
+    Serial.printf("Data : %s\n", packetBuffer);
+    Serial.println();
+  }
+  */
+  
+  delay(2000);
+  //Передача информации на RPi
+  udp.beginPacket(serverip, serverport);
+  char buf[256];
+
+  //Варинат для постоянного (пока через UDP) использования, через такой формат передачи на стороне RPi будет работать интерфейс
+  //sprintf(buf, "%lu %f %f", start_time, curr_t_pod, curr_t_ctrl);
+  
+  //Время с начала работы
+  //unsigned long start_time = millis();
+  
+  //Перевод милисекунд
+  int hours = millis() / (60 * 60 * 1000);
+  int minuts = millis() / (60 * 1000) - hours * 60;
+  int seconds = millis() / 1000 - hours * 3600 - minuts * 60;
+ 
+  
+  sprintf(buf, "%.2d:%.2d:%.2d %.2f %.2f %.2f %.2f", hours, minuts, seconds, curr_t_pod, curr_t_nag, curr_t_ctrl, curr_t_mag);
+  
+  //sprintf(buf, "|Time %d:%d:%f %lu | temp of plate: %f | temp of  heater: %f | temp of shaft: %f | temp of magnetron: %f |", hours, minuts, seconds, start_time, curr_t_nag, curr_t_ctrl, curr_t_mag); //Временный вариант для удобного считывания показаний пока не работает интерфейс
+  //sprintf(buf, "|Time %.2d:%.2d:%.2d | temp of plate: %.2f | temp of  heater: %.2f | temp of mag: %.2f | temp of shaft: %.2f |", hours, minuts, seconds, curr_t_pod, curr_t_nag, curr_t_ctrl, curr_t_mag); 
+  //sprintf(buf, "|Time %.2d:%.2d:%.2d | temp of plate: %.2f | temp of  heater: %.2f | temp of mag: %.2f | temp of shaft: %.2f |\n|Temp of sensors     | temp of plate: %.2f | temp of  heater: %.2f | temp of mag: %.2f | temp of shaft: %.2f |", hours, minuts, seconds, curr_t_pod, curr_t_nag, curr_t_ctrl, curr_t_mag, curr_t_pod_d, curr_t_nag_d, curr_t_ctrl_d, curr_t_mag_d);
+  //Временный вариант для удобного считывания показаний пока не работает интерфейс
+  udp.printf(buf); //Запись пакета с данными на RPi
+  udp.endPacket(); //Завершение пакета и его отправка
+  
+  //sprintf(buf1, "|Temp of sensors     | temp of plate: %.2f | temp of  heater: %.2f | temp of mag: %.2f | temp of shaft: %.2f |", curr_t_pod_d, curr_t_nag_d, curr_t_ctrl_d, curr_t_mag_d);
+  //udp.printf(buf1); //Запись пакета с данными на RPi
+  //udp.endPacket(); //Завершение пакета и его отправка
+
+
   if ((Status == On) or (Status == Done)) {regulator_check();} else {digitalWrite(Relay_pin, LOW);} //Срабатывает по таймеру и условию, чтобы передать температуру и изменить состояние реле
   if (tmr_print.ready(1) and Display_st) {print_display();} //Вывод информации на lcd дисплей
   serialget();
